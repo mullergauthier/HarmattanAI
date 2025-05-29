@@ -1,0 +1,12 @@
+streamlit
+semantic-kernel
+azure.identity
+azure.ai.projects
+azure.core
+azure.ai.projects
+azure-monitor-opentelemetry
+authlib
+azure.ai.inference
+azure.ai.agents
+
+openai
