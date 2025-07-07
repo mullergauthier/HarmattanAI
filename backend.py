@@ -5,18 +5,12 @@ import asyncio
 import logging
 import json
 import re
-import httpx
-import certifi
+from typing import Optional, List, Dict
 
 # Azure specific imports
 from azure.identity import ClientSecretCredential
-from azure.identity.aio import ClientSecretCredential as AsyncClientSecretCredential
 from azure.core.exceptions import ClientAuthenticationError, HttpResponseError, ResourceNotFoundError
-from semantic_kernel.agents import AzureAIAgent, AzureAIAgentSettings
 from azure.ai.projects import AIProjectClient
-
-# OpenAI specific imports
-from openai import OpenAI
 
 # OpenTelemetry specific imports
 from opentelemetry import trace
@@ -34,7 +28,7 @@ def setup_logging():
     )
     logger = logging.getLogger(__name__)
     # Suppress verbose logs
-    for lib in ("azure", "opentelemetry", "httpx", "urllib3", "azure.identity", "openai"):
+    for lib in ("azure", "opentelemetry", "httpx", "urllib3", "azure.identity"):
         logging.getLogger(lib).setLevel(logging.WARNING)
     logging.getLogger("opentelemetry.instrumentation.instrumentor").setLevel(logging.ERROR)
     logging.getLogger("opentelemetry.trace").setLevel(logging.ERROR)
@@ -50,96 +44,211 @@ logger = setup_logging()
 tracer = trace.get_tracer("HarmattanAI_Backend")
 AGENT_CALL_TIMEOUT = 120.0
 
+# --- AZURE CREDENTIALS AND CLIENT INITIALIZATION ---
+def get_azure_credential() -> ClientSecretCredential:
+    """
+    Creates Azure credentials using client secret from environment variables.
+    These should be set by the Streamlit app from secrets.toml.
+    """
+    try:
+        credential = ClientSecretCredential(
+            tenant_id=os.environ["AZURE_TENANT_ID"],
+            client_id=os.environ["AZURE_CLIENT_ID"],
+            client_secret=os.environ["AZURE_CLIENT_SECRET"],
+        )
+        # Test the credential
+        token = credential.get_token("https://ai.azure.com/.default")
+        logger.info("Azure credentials validated successfully")
+        return credential
+    except KeyError as key_err:
+        logger.error(f"Missing required environment variable: {key_err}")
+        raise KeyError(f"Missing required environment variable: {key_err}") from key_err
+    except Exception as e:
+        logger.error(f"Failed to create Azure credentials: {e}")
+        raise RuntimeError(f"Azure credential initialization failed: {e}")
+
+def create_project_client() -> AIProjectClient:
+    """
+    Constructs an AIProjectClient using environment variables.
+    """
+    try:
+        # Use the project endpoint from your secrets
+        project_endpoint = os.environ["AZURE_AI_PROJECT_ENDPOINT"]
+        subscription_id = os.environ["AZURE_SUBSCRIPTION_ID"]
+        resource_group = os.environ["AZURE_RESOURCE_GROUP_NAME"]
+        project_name = os.environ["AZURE_AI_PROJECT_NAME"]
+        credential = get_azure_credential()
+        
+        client = AIProjectClient(
+            endpoint=project_endpoint,
+            credential=credential,
+            subscription_id=subscription_id,
+            resource_group_name=resource_group,
+            project_name=project_name,
+        )
+        logger.info("AIProjectClient initialized successfully")
+        return client
+    except KeyError as key_err:
+        logger.error(f"Missing required environment variable: {key_err}")
+        raise KeyError(f"Missing required environment variable: {key_err}") from key_err
+    except Exception as ex:
+        logger.error(f"Failed to initialize AIProjectClient: {ex}")
+        raise RuntimeError(f"Failed to initialize AIProjectClient: {ex}") from ex
+
+# Initialize global clients - use lazy initialization
+PROJECT_CLIENT = None
+
+def get_or_create_project_client() -> AIProjectClient:
+    """
+    Gets the global PROJECT_CLIENT or creates it if not initialized.
+    """
+    global PROJECT_CLIENT
+    if PROJECT_CLIENT is None:
+        PROJECT_CLIENT = create_project_client()
+    return PROJECT_CLIENT
+
 # --- AZURE AGENT INVOCATION ---
-async def run_azure_agent(user_input: str) -> str | None:
-    """Invokes the Azure AI Agent."""
+def azure_agent_chat(
+    user_message: str,
+    icd_website: str,
+    language: str,
+    agent_id: Optional[str] = None
+) -> str:
+    """
+    Creates a new thread, sends a system instruction with ICD website and language,
+    sends the user message, runs the agent, and returns the agent's reply.
+    """
+    try:
+        project_client = get_or_create_project_client()
+        agents_client = project_client.agents
+    except Exception as e:
+        raise RuntimeError(f"Failed to initialize Azure project client: {e}")
+    
+    # Use environment variable for agent ID if not provided
+    if agent_id is None:
+        agent_id = os.environ.get("AZURE_AI_AGENT_AGENT")
+        if not agent_id:
+            raise ValueError("No agent ID provided and AZURE_AI_AGENT_AGENT not set in environment")
+    
+    # Create system prompt with ICD website and language
+    system_prompt = (
+        f"You are an agent tasked with classifying notes from doctors into ICD-10 codes, "
+        f"using only the official ICD-10 classification provided by the World Health Organization at {icd_website} (language: {language}).\n\n"
+        f"For each input note, extract up to 15 relevant ICD-10 codes. Each code must strictly follow the format: one letter, two digits, a dot, and one digit (e.g., X99.9).\n\n"
+        f"Your output should be a JSON array with each element structured as follows:\n\n"
+        f"  {{\n    \"extract\": \"str\",       // The input note from the doctor used to codify\n    \"code\": \"str\",          // The ICD-10 code in X99.9 format\n    \"description\": \"str\",   // A short description of the ICD-10 code (in the selected language)\n    \"url\": \"str\"            // The exact URL to the ICD-10 code page on the WHO website\n  }}\n\n"
+        f"If no valid ICD-10 code is found, return an empty JSON array. Do not include any additional text or formatting outside of the JSON structure.\n"
+        f"A code should only appear once.\n"
+        f"If, and only if a patient have more than 65, it's an old people, You can add R54: senility\n"
+    )
+    
+    try:
+        # 1. Create a fresh thread using the correct API method
+        thread = agents_client.threads.create(body={})
+        thread_id = thread.id
+        logger.info(f"Created thread: {thread_id}")
+        
+        # 2. Post the system message first  
+        system_message = agents_client.messages.create(
+            thread_id=thread_id,
+            role="assistant",
+            content=system_prompt
+        )
+        logger.info("Posted system message to thread")
+        
+        # 3. Post the user's message
+        user_message_obj = agents_client.messages.create(
+            thread_id=thread_id,
+            role="user",
+            content=user_message
+        )
+        logger.info("Posted user message to thread")
+        
+        # 4. Trigger processing (run the agent)
+        run = agents_client.runs.create_and_process(
+            thread_id=thread_id,
+            agent_id=agent_id
+        )
+        
+        # 5. Check run status
+        if run.status == "failed":
+            error_msg = f"Agent run failed: {getattr(run, 'last_error', 'Unknown error')}"
+            logger.error(error_msg)
+            raise RuntimeError(error_msg)
+        
+        logger.info(f"Agent run completed with status: {run.status}")
+        
+        # 6. Retrieve all messages and return the last assistant reply
+        messages = agents_client.messages.list(
+            thread_id=thread_id,
+            order="desc"  # Get newest messages first
+        )
+        
+        # ItemPaged objects are iterable directly, no need for .data
+        for msg in messages:
+            if msg.role == "assistant" and msg.content:
+                # Handle different content formats
+                if hasattr(msg, 'text_messages') and msg.text_messages:
+                    response = msg.text_messages[-1].text.value
+                    logger.info("Retrieved agent response")
+                    return response
+                elif isinstance(msg.content, list):
+                    for content_item in msg.content:
+                        if hasattr(content_item, 'text') and hasattr(content_item.text, 'value'):
+                            response = content_item.text.value
+                            logger.info("Retrieved agent response")
+                            return response
+                elif isinstance(msg.content, str):
+                    response = msg.content
+                    logger.info("Retrieved agent response")
+                    return response
+        
+        logger.warning("No response found from agent")
+        return "No reply from agent."
+        
+    except HttpResponseError as e:
+        error_msg = f"HTTP error during agent communication: {e.status_code} {getattr(e, 'message', str(e))}"
+        logger.error(error_msg)
+        raise RuntimeError(error_msg)
+    except Exception as e:
+        error_msg = f"Unexpected error during agent communication: {str(e)}"
+        logger.error(error_msg, exc_info=True)
+        raise RuntimeError(error_msg)
+
+async def run_azure_agent(user_input: str, icd_website: str, language: str, agent_id: Optional[str] = None) -> str | None:
+    """
+    Async wrapper for azure_agent_chat to maintain compatibility with existing code.
+    """
     with tracer.start_as_current_span("run_azure_agent") as span:
         try:
-            creds_async = AsyncClientSecretCredential(
-                tenant_id=os.environ["AZURE_TENANT_ID"],
-                client_id=os.environ["AZURE_CLIENT_ID"],
-                client_secret=os.environ["AZURE_CLIENT_SECRET"]
+            # Run the synchronous azure_agent_chat in a thread pool
+            loop = asyncio.get_event_loop()
+            response = await loop.run_in_executor(
+                None, 
+                azure_agent_chat, 
+                user_input, 
+                icd_website, 
+                language,
+                agent_id
             )
-            async with creds_async, AzureAIAgent.create_client(credential=creds_async) as client:
-                settings = AzureAIAgentSettings.create()
-                agent_def = await asyncio.wait_for(
-                    client.agents.get_agent(agent_id=os.environ["AZURE_AI_AGENT_AGENT"]),
-                    timeout=AGENT_CALL_TIMEOUT
-                )
-                agent = AzureAIAgent(client=client, definition=agent_def, settings=settings)
-                api_response = await asyncio.wait_for(
-                    agent.get_response(messages=user_input),
-                    timeout=AGENT_CALL_TIMEOUT
-                )
-            return str(api_response)
-        except (ClientAuthenticationError, HttpResponseError, asyncio.TimeoutError, Exception) as e:
+            return response
+        except Exception as e:
             logger.error(f"Error in run_azure_agent: {e}", exc_info=True)
-            # Re-raise a generic exception to be caught by the dispatcher
             raise ConnectionError(f"Failed to communicate with Azure AI Service: {type(e).__name__}")
 
-
-# --- OPENAI AGENT INVOCATION ---
-async def run_openai_agent(user_input: str) -> str | None:
-    """Invokes the OpenAI API with SSL verification handling."""
-    with tracer.start_as_current_span("run_openai_agent") as span:
-        if "OPENAI_API_KEY" not in os.environ:
-            raise ValueError("OpenAI API key is not configured.")
-        
-        try:
-            # Create a custom httpx client to handle SSL verification
-            with httpx.Client(verify=None) as http_client:
-                client = OpenAI(api_key=os.environ["OPENAI_API_KEY"], http_client=http_client)
-                response = client.responses.create(
-                model="gpt-4o",
-                input=[
-                    {
-                    "role": "system",
-                    "content": [
-                        {
-                        "type": "input_text",
-                        "text": "You are an agent tasked with classifying notes from French doctors into ICD-10 codes, using only the official ICD-10 classification provided by the World Health Organization at https://icd.who.int/browse10/2019/en#.\n\nFor each input note, extract up to 15 relevant ICD-10 codes. Each code must strictly follow the format: one letter, two digits, a dot, and one digit (e.g., X99.9).\n\nYour output should be a JSON  with each element structured as follows:\n\n  {\n    \"extract\": \"str\",       // The input note from the doctor used to codify\n    \"code\": \"str\",          // The ICD-10 code in X99.9 format\n    \"description\": \"str\",   // A short description of the ICD-10 code\n    \"url\": \"str\"            // The exact URL to the ICD-10 code page on the WHO website\n  }\n... : ...\n  // up to 15 items\n\nIf no valid ICD-10 code is found, return an empty JSON . Do not include any additional text or formatting outside of the JSON structure.\nA code should only appear once. \nIf, and only if a patient have more than 65, it's an old people, You can add R54  : senility\n"
-                        }
-                    ]
-                    },
-                    {
-                    "role": "user",
-                    "content": [
-                        {
-                        "type": "input_text",
-                        "text": user_input
-                        }
-                    ]
-                    }
-                ],
-                text={
-                    "format": {
-                    "type": "text"
-                    }
-                },
-                reasoning={},
-                tools=[
-                    {
-                    "type": "web_search_preview",
-                    "user_location": {
-                        "type": "approximate",
-                        "country": "FR"
-                    },
-                    "search_context_size": "low"
-                    }
-                ],
-                temperature=1,
-                max_output_tokens=2048,
-                top_p=1,
-                store=True
-                )
-            return response.output_text
-        except httpx.ConnectError as e:
-            logger.error(f"SSL Connection Error calling OpenAI API: {e}", exc_info=True)
-            raise ConnectionError("SSL Connection Failed: Could not verify the server's certificate.")
-        except Exception as e:
-            logger.error(f"Error calling OpenAI API: {e}", exc_info=True)
-            raise ConnectionError(f"Failed to communicate with OpenAI Service: {type(e).__name__}")
-
+# --- UTILITY FUNCTIONS ---
+def list_available_agents(limit: int = 100) -> List[Dict[str, str]]:
+    """
+    Returns a list of dicts with 'id' and 'name' for all agents in the project.
+    """
+    try:
+        project_client = get_or_create_project_client()
+        agents_client = project_client.agents
+        agents = agents_client.list_agents(limit=limit)
+        return [{"id": ag.id, "name": ag.name} for ag in agents]
+    except Exception as e:
+        logger.error(f"Error listing agents: {e}")
+        raise RuntimeError(f"Failed to list agents: {e}")
 
 # --- DATA PROCESSING ---
 def extract_json_from_string(text: str) -> str | None:
@@ -154,18 +263,15 @@ def extract_json_from_string(text: str) -> str | None:
     return None
 
 # --- MAIN DISPATCHER ---
-async def get_agent_response_async(user_input: str, provider: str) -> list | None:
+async def get_agent_response_async(user_input: str, provider: str, icd_website: str, language: str, agent_id: Optional[str] = None) -> list | None:
     """
-    Runs the selected agent, parses the JSON response, and handles errors.
+    Runs the Azure agent, parses the JSON response, and handles errors.
     Returns a list of dictionaries or raises an exception on failure.
     """
-    raw_response = None
-    if provider == "Azure":
-        raw_response = await run_azure_agent(user_input)
-    elif provider == "OpenAI":
-        raw_response = await run_openai_agent(user_input)
-    else:
-        raise ValueError(f"Invalid provider selected: {provider}")
+    if provider != "Azure":
+        raise ValueError(f"Only Azure provider is supported. Invalid provider: {provider}")
+    
+    raw_response = await run_azure_agent(user_input, icd_website, language, agent_id)
 
     if raw_response is None:
         logger.error("Agent returned no response.")
@@ -188,7 +294,7 @@ async def get_agent_response_async(user_input: str, provider: str) -> list | Non
         logger.error(f"Error parsing JSON response: {e}", exc_info=True)
         raise ValueError("Failed to parse the JSON data received from the agent.")
 
-def get_agent_response_sync(user_input: str, provider: str) -> list | None:
+def get_agent_response_sync(user_input: str, provider: str, icd_website: str, language: str, agent_id: Optional[str] = None) -> list | None:
     """Synchronous wrapper for the async agent call."""
     # This allows the Streamlit app to call the async logic simply.
-    return asyncio.run(get_agent_response_async(user_input, provider))
+    return asyncio.run(get_agent_response_async(user_input, provider, icd_website, language, agent_id))

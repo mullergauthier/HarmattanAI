@@ -1,21 +1,49 @@
-venv
-/test
-debug.log
-.streamlit/secrets.toml
+# Virtual Environments
+venv/
+.venv/
+env/
 .env
-.venv
 
-__pycache__/
-*.pyc
-__pycache__/\n*.pyc
-
+# Python Cache
 __pycache__/
 *.pyc
 *.pyo
 *.pyd
 .Python
-.venv/
-.env
-*.sqlite3
+
+# Logs
+debug.log
 *.log
+
+# Streamlit Secrets
+.streamlit/secrets.toml
+
+# Environment Variables
+.env
+.env.local
+.env.development.local
+.env.test.local
+.env.production.local
+
+# Database
+*.sqlite3
+*.db
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Test files
+/test
+test/
+
+# Temporary files
+*.tmp
+*.temp
 

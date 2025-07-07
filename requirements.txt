@@ -1,12 +1,6 @@
 streamlit
-semantic-kernel
+azure-ai-projects>=1.0.0b11
 azure.identity
-azure.ai.projects
 azure.core
-azure.ai.projects
 azure-monitor-opentelemetry
 authlib
-azure.ai.inference
-azure.ai.agents
-
-openai

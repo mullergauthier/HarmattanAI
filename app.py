@@ -3,7 +3,7 @@
 import streamlit as st
 import pandas as pd
 import os
-from backend import get_agent_response_sync, logger # Import backend functions
+from backend import get_agent_response_sync, list_available_agents, logger # Import backend functions
 
 # --- INITIALIZATION & CONFIGURATION ---
 def load_secrets():
@@ -17,17 +17,12 @@ def load_secrets():
             "AZURE_CLIENT_SECRET": svc_azure.AZURE_CLIENT_SECRET,
             "AZURE_SUBSCRIPTION_ID": svc_azure.AZURE_SUBSCRIPTION_ID,
             "AZURE_RESOURCE_GROUP_NAME": svc_azure.AZURE_RESOURCE_GROUP_NAME,
-            "AZURE_AI_AGENT_AGENT": svc_azure.AZURE_AI_AGENT_AGENT
+            "AZURE_AI_PROJECT_NAME": svc_azure.AZURE_AI_PROJECT_NAME,
+            "AZURE_AI_AGENT_AGENT": svc_azure.AZURE_AI_AGENT_AGENT,
+            "AZURE_AI_PROJECT_ENDPOINT": svc_azure.AZURE_AI_PROJECT_ENDPOINT
         })
         logger.info("Azure secrets loaded.")
-
-        # Load OpenAI secret
-        if 'openai' in st.secrets and 'OPENAI_API_KEY' in st.secrets.openai:
-            os.environ["OPENAI_API_KEY"] = st.secrets.openai.OPENAI_API_KEY
-            logger.info("OpenAI secret loaded.")
-        else:
-            logger.warning("OpenAI secrets not found. The OpenAI provider will not be available.")
-            
+        
         st.session_state.secrets_loaded = True
         
     except Exception as e:
@@ -70,10 +65,68 @@ with st.sidebar:
     except Exception:
         st.warning("Logo image not found.")
 
-    api_provider_options = ["OpenAI","Azure"]
+    # --- AGENT SELECTION ---
+    col1, col2 = st.columns([3, 1])
+    
+    with col2:
+        if st.button("🔄", help="Refresh agents list"):
+            if "available_agents" in st.session_state:
+                del st.session_state.available_agents
+            st.rerun()
+    
+    try:
+        # Load available agents from Azure
+        if "available_agents" not in st.session_state:
+            with st.spinner("Loading available agents..."):
+                st.session_state.available_agents = list_available_agents()
         
-    api_provider = st.selectbox("Select API Provider:", api_provider_options, key="api_provider_selection",index=0)
+        available_agents = st.session_state.available_agents
+        
+        if available_agents:
+            # Create a dictionary mapping display names to agent IDs
+            agent_options = {f"{agent['name']} ({agent['id'][:8]}...)": agent['id'] for agent in available_agents}
+            
+            with col1:
+                selected_agent_display = st.selectbox(
+                    "Select AI Agent:", 
+                    list(agent_options.keys()), 
+                    key="agent_selection"
+                )
+            selected_agent_id = agent_options[selected_agent_display]
+        else:
+            st.error("No agents found in the project.")
+            selected_agent_id = None
+            
+    except Exception as e:
+        st.error(f"Failed to load agents: {e}")
+        # Fallback to environment variable
+        selected_agent_id = None
+        st.info("Using default agent from environment configuration.")
+    
     system_selection = st.selectbox("Select Target System:", ["Hopital Management", "DEDALUS", "CEGEDIM"], key="system_selection")
+
+    # --- ICD-10 Website and Language Selection ---
+    icd_websites = {
+        "ICD-10 2019 (EN)": "https://icd.who.int/browse10/2019/en",
+        "ICD-10 2019 (FR)": "https://icd.who.int/browse10/2019/fr",
+        "ICD-10 2025 (EN)": "https://icd.who.int/browse/2025-01/mms/en",
+        "ICD-10 2025 (FR)": "https://icd.who.int/browse/2025-01/mms/fr"
+    }
+    icd_website_label = st.selectbox(
+        "Select ICD-10 Website:",
+        list(icd_websites.keys()),
+        key="icd_website_selection",
+        index=0
+    )
+    icd_website = icd_websites[icd_website_label]
+
+    # Allow user to add a custom ICD-10 website
+    custom_icd_url = st.text_input("Or enter a custom ICD-10 website URL:", key="custom_icd_url")
+    if custom_icd_url.strip():
+        icd_website = custom_icd_url.strip()
+
+    language_options = ["en", "fr"]
+    language = st.selectbox("Select Language:", language_options, key="language_selection", index=0)
 
     if st.user.is_logged_in:
         with st.expander(f"👤 User: {st.user.name}"):
@@ -106,10 +159,27 @@ if st.button("Analyze Notes", type="primary", disabled=not st.user.is_logged_in)
     if not doctor_notes.strip():
         st.warning("Please paste the doctor's notes into the text area before analyzing.")
     else:
-        with st.spinner(f"Sending request to {api_provider}... Please wait."):
+        # Get the selected agent name for display
+        agent_display_name = "Azure AI Agent"
+        if "available_agents" in st.session_state and st.session_state.available_agents:
             try:
-                # Call the backend to get data
-                response_data = get_agent_response_sync(doctor_notes, api_provider)
+                for agent in st.session_state.available_agents:
+                    if agent['id'] == selected_agent_id:
+                        agent_display_name = agent['name']
+                        break
+            except:
+                pass
+                
+        with st.spinner(f"Sending request to {agent_display_name}... Please wait."):
+            try:
+                # Call the backend to get data with selected agent
+                response_data = get_agent_response_sync(
+                    doctor_notes, 
+                    "Azure",  # Provider is always Azure now
+                    icd_website, 
+                    language,
+                    selected_agent_id  # Pass the selected agent ID
+                )
                 st.session_state.agent_response_data = response_data
                 st.session_state.validation_states = {} # Reset validation on new data
                 if response_data:
