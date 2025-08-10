@@ -3,7 +3,8 @@
 import streamlit as st
 import pandas as pd
 import os
-from backend import get_agent_response_sync, list_available_agents, logger # Import backend functions
+from backend import get_agent_response_sync, logger # Import backend functions
+from azure_client import list_available_agents # Import Azure client functions
 
 # --- INITIALIZATION & CONFIGURATION ---
 def load_secrets():
